@@ -1,0 +1,29 @@
+# Merge into the scheduler ConfigMap's volcano-scheduler.conf.
+# Stage 1 uses allocate/backfill. Validate separately before enabling preempt/reclaim.
+actions: "enqueue, allocate, backfill"
+tiers:
+  - plugins:
+      - name: priority
+      - name: gang
+      - name: conformance
+  - plugins:
+      - name: drf
+      - name: predicates
+      - name: proportion
+      - name: halfbinpack
+        enablePredicate: true
+        enableNodeOrder: true
+        arguments:
+          config:
+            prometheusAddress: "http://prometheus.monitoring.svc:9090"
+            # node must exactly match Kubernetes Node.metadata.name.
+            cpuQuery: '100 * (1 - avg by (node) (rate(node_cpu_seconds_total{mode="idle"}[1m])))'
+            timestampQuery: 'min by (node) (timestamp(node_cpu_seconds_total{mode="idle"}))'
+            npuResources: "huawei.com/Ascend910,huawei.com/Ascend310"
+            lowerThreshold: 40
+            upperThreshold: 70
+            maxAgeSeconds: 60
+            # >= rate window + scrape interval + scheduler metrics delay.
+            blindSeconds: 120
+            minPodMilliCPU: 250
+            weight: 1
