@@ -1,86 +1,84 @@
-# NPU / CPU 混部一期：halfbinpack
+# NPU / CPU 混部一期：按资源分配比例装箱
 
-## 需求与口径
+## 需求与实施口径
 
-允许 CPU 业务利用 NPU 节点的空闲 CPU，并在指定负载范围内优先装箱。经确认，阈值采用**监控采集的真实节点 CPU 使用率**。CPU requests 仅用于新 Pod 的负载预估和 Kubernetes 资源可行性检查，不替代真实使用率。
+本版本替换此前按真实 CPU 使用率装箱的实现。资源分配比例与实时使用率不是同一个指标：真实负载再低，也不能突破纯 CPU 业务的 requests 配额。插件不再查询 Prometheus，也不需要监控服务。
 
-源码基线：Volcano master，2026-10-22 查询到提交 `ab52d0d95ff59357a5ce4bf2d1fc4f4364d75f64`。本工作区通过 master 源码归档获取，不包含 Git 历史。部署到其他 release 前需适配并验证框架 API。
+集群只配置一个 `cpuRatio` 百分数，默认 30，取值 0–100；同一比例独立应用到每个混部节点。这里的“集群粒度”指统一策略，而非允许单个节点借用其他节点的额度。暂不支持业务、队列、命名空间、Pod 或单节点覆盖。
 
-上游参考：
-
-- [binpack](https://github.com/volcano-sh/volcano/blob/ab52d0d95ff59357a5ce4bf2d1fc4f4364d75f64/pkg/scheduler/plugins/binpack/binpack.go)：按 requests 装箱，没有真实负载准入阈值。
-- [usage](https://github.com/volcano-sh/volcano/blob/ab52d0d95ff59357a5ce4bf2d1fc4f4364d75f64/pkg/scheduler/plugins/usage/usage.go)：具有真实负载过滤和影子负载，但倾向低负载节点，且指标过期时放行。
-- [Prometheus 适配器](https://github.com/volcano-sh/volcano/blob/ab52d0d95ff59357a5ce4bf2d1fc4f4364d75f64/pkg/scheduler/metrics/source/metrics_client_prometheus.go)：查询缺失时仍可能刷新 MetricsTime，不适合直接承担本需求的严格指标有效性检查。
-
-本实现为新增的自定义插件，名称沿用需求中的 halfbinpack；没有假定上游已有同名插件。
-
-## 一期行为
-
-| 对象 | 行为 |
-| --- | --- |
-| Node 带 `volcano.sh/npu-cpu-mixed=true` 且 Capacity 有配置的 NPU 资源 | CPU 混部目标节点 |
-| Pod 带 `volcano.sh/workload-type=cpu` 且不请求配置的 NPU 资源 | 受插件约束的 CPU 业务 |
-| CPU Pod → 混部节点 | 检查指标有效性、预测负载上限，再按装箱得分排序 |
-| CPU Pod → 普通节点 | 本插件放行、返回 0 分；仍须通过其他插件 |
-| NPU Pod | 不受本插件准入阈值限制；新 NPU Pod 的 CPU 预估会占用后续 CPU 混部余量 |
-| 缺失、过期、未来时间或无效指标 | 暂停在对应混部节点接纳 CPU 业务 |
-| 查询错误、部分查询告警、重复节点数据 | 本轮暂停所有混部节点的 CPU 准入，普通节点与 NPU 业务继续走其他调度规则 |
-
-混部是显式启用的。CPU 业务的标签需由提交模板或准入策略保证；未标记 Pod 不受本插件限制。因此，集群必须保持原有 NPU 节点污点，并仅向受控 CPU 业务授予匹配容忍，避免未标记业务绕过阈值。
-
-示例阈值为 `[40%, 70%]`：40% 是目标区间下界，70% 是预测负载准入上限。低于 40% 仍允许启动装箱，否则空闲节点无法进入目标区间。上限包含等号；超过上限拒绝。通过筛选的节点中，预测负载越接近上限分数越高。
-
-## 负载计算
-
-设：
-
-- `U`：Prometheus 监控的真实 CPU 使用率，百分数 0–100。
-- `C`：节点物理 CPU Capacity，单位 milliCPU。与示例 PromQL 的物理 CPU 归一化口径一致；不能用 allocatable 替换。
-- `E(p)=max(p.Resreq.MilliCPU, minPodMilliCPU)`：新 Pod 的预估 CPU 消耗。
-- `R`：已分配但尚未被监控完整覆盖的 Pod 预估 CPU 总量。
-
-准入公式：`U_projected = U + 100 × (R + E(p)) / C`，要求 `U_projected <= upperThreshold`。
-
-例如节点 64 核、真实负载 50%、上限 70%，新 CPU Pod 请求 4 核：预测为 56.25%。首次分配后预留 4 核，第二个同等 Pod 预测为 62.5%，第三个为 68.75%，第四个为 75%，被拒绝。实际 requests 是否可用，仍由标准资源过滤判断。
-
-打分为 0–100 乘 `weight`：低于 lower 的区间映射到 0–50，目标区间映射到 50–100。默认分数会柔性偏好可接纳的混部节点，其他插件的分数可能改变最终排序；不承诺“所有 NPU 节点填满后才能用普通节点”。如需严格两阶段选池，应额外设计节点选择策略。
-
-## 接入与预留
-
-`OnSessionOpen` 在 5 秒超时内批量查询一次 CPU 和原始采样时间，生成本轮快照。Predicate 和 NodeOrder 不执行网络请求。PromQL 必须按 `node` 返回唯一序列，且该标签与 Kubernetes 节点名完全一致。默认 node-exporter 只有 `instance` 标签时，需要增加采集 relabel；不能把 `IP:9100` 直接当节点名。
-
-独立查询 `timestamp(node_cpu_seconds_total)` 的数值，避免把 PromQL 求值时间误当成采样时间。`timestampQuery` 应与 `cpuQuery` 使用相同 exporter、同一节点集合；如配置 recording rule，必须保留对底层 exporter 样本新鲜度的检查。
-
-每轮扫描 Allocated、Binding、Bound、Pipelined 和尚未覆盖完整观测窗口的 Running Pod 重建预留。Allocate 事件按 Pod UID 幂等加入预留，Deallocate 回滚移除预留。异步驱逐进入 Releasing 时保留预留，不提前把尚未释放的 CPU 当作空闲。预留同时计算 CPU 与 NPU 新业务，防止两类业务连续分配时低估负载。
-
-`blindSeconds` 至少覆盖 CPU rate 窗口、采集间隔和监控传播延迟；默认 120 秒。它可能造成短期保守的双计数，但减少新 Pod 尚未进入监控时的超量调度。每轮重建也覆盖调度器重启场景。过期指标即使仍有预留也不会放行。
-
-配置错误会关闭标记节点上的 CPU 混部准入并记录日志。Prometheus 地址与查询仅接受运维配置，不接受业务 Pod 覆盖。当前客户端使用默认系统 TLS 校验；需要认证的集群可通过已受控的监控代理暴露查询服务，尚未新增 bearer token 配置。
-
-## 部署
-
-1. 按实际 NPU Device Plugin 的资源名修改 `npuResources`，不要假定示例覆盖所有 Ascend 机型和虚拟 NPU。
-2. 为目标 Node 添加 `volcano.sh/npu-cpu-mixed=true` 标签。
-3. 使用包含本插件的源码构建 scheduler 镜像；`factory.go` 已注册插件。
-4. 合并 `example/halfbinpack/scheduler.yaml` 到现有 scheduler ConfigMap，保留业务所需的其他插件。开启 Predicate 和 NodeOrder。
-5. 一期使用 enqueue / allocate / backfill；preempt / reclaim 的模拟路径需单独验证后启用。
-6. CPU 业务设置 `schedulerName: volcano` 和 workload 标签。按真实污点授予精确 toleration，并移除排除 NPU 节点的硬性 nodeSelector / affinity。不要 blanket 容忍全部污点。
-7. 将 Prometheus node 标签与 Kubernetes 名称对齐，验证 CPU 数值为百分数而非 0–1 比例，并测试 exporter 中断后 60 秒内停止新 CPU 混部。
-8. 灰度到少量节点，再观测 NPU 任务延迟、吞吐和 CPU throttling，调整上限与 CPU limits。
-
-一期没有动态超卖：当现有 Pod requests 已占满 allocatable 时，即使实际 CPU 空闲也不能继续调度。要释放这部分空闲，需要合理调整 requests；超卖资源上报应另立需求。
-
-## 验证与边界
-
-单元测试覆盖上限等值、连续分配、重复事件、回滚、异步驱逐、跨轮暖启动、NPU 分类、指标缺失/过期/未来时间、无效配置，以及 Prometheus 空响应、异常值、重复节点和 HTTP 失败。运行：
-
-```sh
-CGO_ENABLED=0 go test ./pkg/scheduler/plugins/halfbinpack
-CGO_ENABLED=0 go test ./pkg/scheduler/plugins
+```
+节点纯 CPU 配额(milliCPU) = floor(节点物理 CPU Allocatable(milliCPU) × cpuRatio / 100)
+纯 CPU 业务 requests 总量 + 新纯 CPU Pod requests ≤ 节点纯 CPU 配额
 ```
 
-集群验收至少包括：普通 CPU 节点回退、NPU 正常调度、真实压力升高后停止 CPU 准入、指标恢复后恢复准入、gang 分配回滚、调度器重启及连续批量 Pod 分配。源码测试不能替代这些集群验收。
+使用 Node.status.allocatable 的物理 CPU，排除 Capacity 与 Volcano 合成的超卖资源。按 milliCPU 向下取整。requests 使用 Volcano 的 Pod 资源计算器，包含普通容器、init 容器、可重启 sidecar 和 Pod overhead，并采用其原地扩缩容资源计算逻辑。
 
-2026-10-22 本地验证：使用临时 Go 1.26.0、`CGO_ENABLED=0`，上述两个包的 `go test` 均通过；新增 Go 文件及 factory.go 的 gofmt 检查通过。HTTP 测试使用本地模拟 Prometheus，并已验证框架 Predicate / NodeOrder 注册与调用。尚未部署到真实 Kubernetes / NPU 集群，未进行端到端或真实性能验证。
+| 一期需求 | 实现 |
+| --- | --- |
+| NPU / CPU 混部 | 在 NPU 节点允许两类 Pod 调度，保留标准资源、亲和性、污点等可行性检查 |
+| 为 NPU 保留 CPU 分配空间 | 纯 CPU 业务最多分配 r%，不占用剩余 1-r 的 CPU requests 空间；NPU Pod 不消耗纯 CPU 配额 |
+| 按比例装箱 | 合法节点得分为分配后纯 CPU requests / 纯 CPU 配额，越接近配额分数越高 |
+| 与 NPU 是否分配无关 | 按节点 Capacity 是否声明 NPU 识别，不按 Idle NPU 数量开关配额 |
+| 集群统一比例 | scheduler 插件配置统一传入 cpuRatio，不读取 Pod 覆盖参数 |
+| Pod 优先级抢占与配额 | 严格筛选更低 Pod 优先级受害者，并优先选择更低优先级；普通分配、流水线预留、抢占模拟均检查 CPU 配额 |
 
-真实 CPU 负载受存量业务突增、监控延迟及实际用量超过 requests 等因素影响。本插件提供**调度时的准入控制与装箱偏好**，无法保证运行时 CPU 使用率永久不超过上限；一期不含自动驱逐、迁移或 NPU 业务 CPU 硬隔离。需要运行时保障时，应配合 CPU limits、优先级以及后续驱逐/资源隔离策略。
+## 识别范围与安全边界
+
+只要 Node Capacity 有 `npuResources` 配置中的任一 NPU 资源，该节点即受管理，无需依赖业务标签。也可通过 `volcano.sh/npu-cpu-mixed=true` 显式纳入节点，即使 NPU 设备暂时未报告。
+
+请求任一配置 NPU 资源的 Pod 视为 NPU 业务；其他 Pod 均按纯 CPU 业务计入配额。`volcano.sh/workload-type` 标签可供业务识别，但不能授予配额豁免，删除标签或伪造为 npu 都不能绕过配额。NPU 资源名必须与 Device Plugin 实际报告一致，包括虚拟 NPU 型号；不在列表内的加速资源按纯 CPU 业务保守处理。
+
+已有非 NPU DaemonSet、系统 Pod 和由其他调度器绑定的非 NPU Pod，在 Volcano 节点快照可见时也计入纯 CPU requests。新纯 CPU Pod 必须声明正数 CPU requests，否则拒绝进入混部节点。CPU-only Pod 的零 requests 不会被“估计成 250m”，以免把估计值误当成配额。
+
+本插件仅能控制经过此 Volcano 调度器的分配。ERS 必须保证混部业务使用 `schedulerName: volcano`，禁止通过直接设置 spec.nodeName 或其他调度器绕过准入，并通过准入策略控制已绑定 Pod 的原地扩容，避免扩容请求绕过调度器配额检查。不存在调度插件能够约束所有外部直接绑定操作的保证。
+
+## 状态记账、释放与抢占模拟
+
+直接读取传入的 `NodeInfo.Tasks`，持续计算所有活动纯 CPU Pod 的 requests，已运行很久的 Pod 仍计费，Succeeded / Failed 不计费。没有会在 session 结束时清空的独立配额缓存。调度快照自带的事务回滚、任务移除和重启重建会自然恢复正确额度。
+
+为兼容异步抢占和 Volcano Pipeline，分别检查：
+
+- 当前分配账：计入 Releasing，排除尚未实际运行的 Pipelined；实际 Allocate 事件必须通过此检查。受害 Pod 尚未删除时，不允许新 Pod 提前使用它的 CPU 分配额度。
+- 未来预留账：排除 Releasing，计入 Pipelined；Predicate、NodeOrder、Pipeline 事件与抢占模拟使用此账。可以为替换受害 Pod 预留额度，但不是提前绑定运行。之后 Allocate 仍须通过当前账及标准物理空闲资源检查。
+
+候选 Pod 在节点快照中已存在时只计一次。Allocate 事件再次校验配额，调用方即使跳过 Predicate 也不能突破分配上限。NPU 业务不计入纯 CPU 配额，仍需通过物理资源可行性检查。
+
+新增 `SimulatePredicateFn`，与普通 Predicate 使用相同配额规则。抢占框架对克隆 NodeInfo 执行 RemoveTask / AddTask，插件直接读取克隆后的 Tasks，因此无需另设易泄漏的模拟配额缓存；移除受害者、恢复受害者、取消事务都会反映在账中。即使抢占者优先级很高，单个纯 CPU Pod 请求量超过节点配额仍无法通过模拟和最终分配。
+
+## Pod 优先级与 ERS
+
+启用 halfbinpack 的 session 使用 `StrictPodPreemption`：
+
+1. Preemptable / Reclaimable 入口统一过滤，受害 Pod 的实际 spec.priority 必须严格小于抢占者。未设置视为 0；相同优先级不可抢占。其他 tier 提前作出决策也不能绕过此过滤。
+2. 受害者队列优先比较实际 Pod 优先级，避免跨 Job / Queue 排序覆盖 Pod 优先级。相同优先级再使用原有排序作为平局规则。
+3. 通算 / 智算身份不会参与优先级比较；支持 PreemptNever。
+4. 样例不启用 stock priority 插件的 Job 优先级受害者过滤，以免跨 Job 使用与需求不同的口径。halfbinpack 提供 Pod TaskOrder 和受害者过滤；队列、公平性、gang 就绪、PDB 和可抢占性等其他调度约束继续生效。
+5. 此阶段只支持 Pod 级 preempt / reclaim。gangpreempt / gangreclaim 没有具体抢占者 Pod 上下文，严格模式下拒绝该类驱逐，不用 Job 优先级冒充 Pod 优先级。
+
+ERS / 业务负责创建或选择 PriorityClass、授予业务使用权限，并决定是否启用 preempt。推荐 NPU 使用较高 PriorityClass，但插件没有硬编码 NPU 优先。见 `example/halfbinpack/priority-classes.yaml`。本仓库没有 ERS 客户端/API；这里提供调度侧约束和配置契约，不声称完成外部 ERS 平台集成。
+
+“CPU 业务不影响 NPU 调度”在本期表示预留 CPU requests 空间并支持优先级腾挪，而非任何 NPU Pod 都保证立即调度。NPU Pod 仍可能因自身请求过大、NPU 已占用、内存不足、亲和性不符等原因 Pending；低优先级 NPU 不得抢占更高优先级 CPU 业务。
+
+## 配置与升级
+
+使用 `example/halfbinpack/scheduler.yaml`。halfbinpack 应位于首个参与受害者决策的 tier，与 gang 规则共同工作，并开启 Predicate、NodeOrder、TaskOrder、Preemptable / Reclaimable。示例关闭 allocate / preempt 的 task-role 失败缓存，避免同角色不同请求量 Pod 共享过期的配额失败结果。
+
+旧配置的 prometheusAddress、upperThreshold、lowerThreshold、blindSeconds 等会被拒绝，不能静默映射为 cpuRatio。配置错误会拒绝调度并记录日志，运维须修正配置。
+
+升级或调低比例前，检查每节点现有纯 CPU requests。若存量已超额，插件不会自行驱逐，阻止进一步超额分配；由 ERS 根据 Pod 优先级排空/替换存量后达到新上限。不要把热更新配置解释为即时自动驱逐。
+
+纯 CPU Pod 示例使用正数 requests 和 CPU limits，并引用推荐 PriorityClass。业务模板还需匹配实际污点容忍和亲和性。生产中需统一配置所有有权操作该节点池的调度器实例。
+
+## 验证与范围
+
+测试包括：NPU 空闲/占满时一致的纯 CPU 上限，稳定运行 Pod 持续计费，无标签与伪造标签不能豁免，init/overhead 计费，0%/100%/小数比例及 milliCPU 边界，纯 CPU/NPU 跨类型优先级、同级拒绝、跨 Job 受害者排序、tier 绕过防护、PreemptNever、抢占模拟移除/恢复、过大高优先级 CPU Pod 拒绝、Pipeline 与 Releasing 分账、Allocate 事件守卫、事务回滚和重启重建。
+
+```sh
+CGO_ENABLED=0 go test ./pkg/scheduler/plugins/halfbinpack ./pkg/scheduler/plugins ./pkg/scheduler/framework
+```
+
+调度分配比例不等于运行时 CPU 使用率硬限制。requests 配额不会自动约束 CPU 瞬时使用量；运行时 CPU 隔离需由 CPU limits/cgroup 或独立 CPU 池实现。本期也没有内存比例隔离。需要这些运行时保障时必须在节点/平台侧另行配置。
+
+真实 NPU 集群验收应覆盖 ERS 提交模板与 PriorityClass 权限、NPU/CPU 跨类型抢占、CPU 配额边界、受害者删除延迟、调度器重启、原地扩容准入、节点资源变更和多实例统一策略。
+
+2026-10-27 本地验证：Go 1.26.0、CGO_ENABLED=0，上述插件/注册包/框架三个包，以及 actions/allocate、actions/backfill、actions/preempt、actions/reclaim 四个包的测试均通过；gofmt 检查通过。新增测试直接调用上游 SelectVictimsOnNode 验证合法替换与高优先级超配额拒绝。尚未在真实 NPU 集群或 ERS 环境验收。

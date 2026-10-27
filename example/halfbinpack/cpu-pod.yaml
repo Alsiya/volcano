@@ -6,6 +6,7 @@ metadata:
     volcano.sh/workload-type: cpu
 spec:
   schedulerName: volcano
+  priorityClassName: mixed-cpu-normal
   # Example taint. Replace with the actual taint on the NPU nodes.
   tolerations:
     - key: dedicated

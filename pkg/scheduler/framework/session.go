@@ -102,7 +102,10 @@ type Session struct {
 
 	Tiers          []conf.Tier
 	Configurations []conf.Configuration
-	NodeList       []*api.NodeInfo
+	// StrictPodPreemption makes victim eligibility/order follow Pod priority across Jobs and Queues.
+	// Opt-in plugins enable this for a session; the default preserves existing scheduling policy.
+	StrictPodPreemption bool
+	NodeList            []*api.NodeInfo
 	// HyperNodes stores the HyperNodeInfo of each HyperNode
 	HyperNodes           api.HyperNodeInfoMap
 	HyperNodeTierNameMap api.HyperNodeTierNameMap
