@@ -1,7 +1,7 @@
 // Copyright 2026 The Volcano Authors.
 // SPDX-License-Identifier: Apache-2.0
 
-// Package halfbinpack packs opted-in CPU pods onto mixed NPU nodes using real CPU load.
+// Package halfbinpack enforces a cluster-configured CPU-only allocation ratio on NPU nodes.
 package halfbinpack
 
 import (
@@ -9,111 +9,109 @@ import (
 	"fmt"
 	"math"
 	"strings"
-	"sync"
-	"time"
 
 	"github.com/mitchellh/mapstructure"
-	promapi "github.com/prometheus/client_golang/api"
-	promv1 "github.com/prometheus/client_golang/api/prometheus/v1"
-	"github.com/prometheus/common/model"
 	v1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/util/validation"
 	"k8s.io/klog/v2"
+	fwk "k8s.io/kube-scheduler/framework"
 
 	"volcano.sh/volcano/pkg/scheduler/api"
 	"volcano.sh/volcano/pkg/scheduler/framework"
+	"volcano.sh/volcano/pkg/scheduler/plugins/util"
 )
 
 const (
-	PluginName    = "halfbinpack"
-	MixedLabel    = "volcano.sh/npu-cpu-mixed"
+	PluginName = "halfbinpack"
+	MixedLabel = "volcano.sh/npu-cpu-mixed"
+	// WorkloadLabel is retained for existing manifests, but never grants a quota exemption.
 	WorkloadLabel = "volcano.sh/workload-type"
 )
 
 type config struct {
-	Address        string  `json:"prometheusAddress"`
-	CPUQuery       string  `json:"cpuQuery"`
-	TimestampQuery string  `json:"timestampQuery"`
-	NPUResources   string  `json:"npuResources"`
-	Lower          float64 `json:"lowerThreshold"`
-	Upper          float64 `json:"upperThreshold"`
-	MaxAgeSeconds  int     `json:"maxAgeSeconds"`
-	BlindSeconds   int     `json:"blindSeconds"`
-	MinPodMilliCPU float64 `json:"minPodMilliCPU"`
-	Weight         float64 `json:"weight"`
-}
-
-type sample struct {
-	percent  float64
-	observed time.Time
-}
-
-type reservation struct {
-	node string
-	cpu  float64
+	// CPURatio is a percentage of physical Allocatable CPU, shared by every NPU node.
+	CPURatio     float64 `json:"cpuRatio"`
+	NPUResources string  `json:"npuResources"`
+	Weight       float64 `json:"weight"`
 }
 
 type plugin struct {
 	cfg       config
 	configErr error
 	npu       []v1.ResourceName
-	mu        sync.RWMutex
-	metrics   map[string]sample
-	reserved  map[api.TaskID]reservation
 }
 
-// New constructs the plugin. Invalid configuration rejects CPU mixing on labeled nodes.
+// New rejects legacy load-threshold arguments: a load percentage is not an allocation quota.
 func New(args framework.Arguments) framework.Plugin {
-	cfg := config{
-		CPUQuery:       `100 * (1 - avg by (node) (rate(node_cpu_seconds_total{mode="idle"}[1m])))`,
-		TimestampQuery: `min by (node) (timestamp(node_cpu_seconds_total{mode="idle"}))`,
-		NPUResources:   "huawei.com/Ascend910,huawei.com/Ascend310",
-		Lower:          40, Upper: 70, MaxAgeSeconds: 60, BlindSeconds: 120,
-		MinPodMilliCPU: 250, Weight: 1,
+	p := &plugin{cfg: config{CPURatio: 30, NPUResources: "huawei.com/Ascend910,huawei.com/Ascend310", Weight: 1}}
+	for key := range args {
+		if key != "config" {
+			p.configErr = fmt.Errorf("halfbinpack: unknown argument %q", key)
+			return p
+		}
 	}
-	// Decode into defaults; configuration errors disable CPU mixing on labeled nodes.
 	if value, ok := args["config"]; ok {
-		decoder, err := mapstructure.NewDecoder(&mapstructure.DecoderConfig{Result: &cfg, TagName: "json", ErrorUnused: true})
+		decoder, err := mapstructure.NewDecoder(&mapstructure.DecoderConfig{Result: &p.cfg, TagName: "json", ErrorUnused: true})
 		if err == nil {
 			err = decoder.Decode(value)
 		}
 		if err != nil {
-			return &plugin{configErr: fmt.Errorf("halfbinpack: invalid config: %w", err)}
+			p.configErr = fmt.Errorf("halfbinpack: invalid config: %w", err)
+			return p
 		}
 	}
-	p := &plugin{cfg: cfg}
-	for _, resource := range strings.Split(cfg.NPUResources, ",") {
-		if name := strings.TrimSpace(resource); name != "" {
-			p.npu = append(p.npu, v1.ResourceName(name))
+	for _, name := range strings.Split(p.cfg.NPUResources, ",") {
+		name = strings.TrimSpace(name)
+		if name == "" {
+			continue
 		}
+		if !strings.Contains(name, "/") || len(validation.IsQualifiedName(name)) != 0 {
+			p.configErr = fmt.Errorf("halfbinpack: invalid NPU resource %q", name)
+			return p
+		}
+		p.npu = append(p.npu, v1.ResourceName(name))
 	}
-	if cfg.Address == "" || cfg.CPUQuery == "" || cfg.TimestampQuery == "" || len(p.npu) == 0 ||
-		!finite(cfg.Lower) || !finite(cfg.Upper) || cfg.Lower < 0 || cfg.Lower >= cfg.Upper || cfg.Upper > 100 ||
-		cfg.MaxAgeSeconds <= 0 || cfg.BlindSeconds < cfg.MaxAgeSeconds ||
-		!finite(cfg.MinPodMilliCPU) || cfg.MinPodMilliCPU <= 0 || !finite(cfg.Weight) || cfg.Weight < 0 {
-		p.configErr = fmt.Errorf("halfbinpack: invalid thresholds, metrics settings, resource names or estimator")
+	if len(p.npu) == 0 || math.IsNaN(p.cfg.CPURatio) || math.IsInf(p.cfg.CPURatio, 0) || p.cfg.CPURatio < 0 || p.cfg.CPURatio > 100 || math.IsNaN(p.cfg.Weight) || math.IsInf(p.cfg.Weight, 0) || p.cfg.Weight < 0 {
+		p.configErr = fmt.Errorf("halfbinpack: cpuRatio must be in [0,100], weight must be nonnegative, and npuResources must be set")
 	}
 	return p
 }
 
 func (*plugin) Name() string { return PluginName }
 
-func (p *plugin) isCPU(task *api.TaskInfo) bool {
-	if task.Pod == nil || task.Pod.Labels[WorkloadLabel] != "cpu" {
-		return false
+// requests includes init containers, restartable sidecars and Pod overhead using Volcano's calculator.
+func requests(task *api.TaskInfo) *api.Resource {
+	if task.Pod != nil {
+		return api.GetPodResourceRequest(task.Pod)
 	}
+	if task.InitResreq != nil {
+		return task.InitResreq
+	}
+	if task.Resreq != nil {
+		return task.Resreq
+	}
+	return api.EmptyResource()
+}
+
+func (p *plugin) isCPU(task *api.TaskInfo) bool {
+	r := requests(task)
 	for _, name := range p.npu {
-		if task.Resreq.Get(name) > 0 {
+		if r.Get(name) > 0 {
 			return false
 		}
 	}
+	// Missing or misleading labels must not bypass the quota.
 	return true
 }
 
-func mixed(node *api.NodeInfo) bool {
-	return node.Node != nil && node.Node.Labels[MixedLabel] == "true"
-}
-
-func (p *plugin) hasNPU(node *api.NodeInfo) bool {
+func (p *plugin) managed(node *api.NodeInfo) bool {
+	if node.Node == nil {
+		return false
+	}
+	if node.Node.Labels[MixedLabel] == "true" {
+		return true
+	}
+	// Detect NPU nodes even if a label is absent, and regardless of available NPU count.
 	for _, name := range p.npu {
 		quantity := node.Node.Status.Capacity[name]
 		if quantity.Sign() > 0 {
@@ -123,200 +121,133 @@ func (p *plugin) hasNPU(node *api.NodeInfo) bool {
 	return false
 }
 
-func (p *plugin) estimate(task *api.TaskInfo) float64 {
-	return math.Max(task.Resreq.MilliCPU, p.cfg.MinPodMilliCPU)
+func (p *plugin) quota(node *api.NodeInfo) float64 {
+	// Use physical Allocatable, not Capacity or synthetic oversubscription resources.
+	return math.Floor(float64(node.Node.Status.Allocatable.Cpu().MilliValue()) * p.cfg.CPURatio / 100)
 }
 
-func (p *plugin) reserve(task *api.TaskInfo) {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	p.reserved[task.UID] = reservation{node: task.NodeName, cpu: p.estimate(task)}
+func active(task *api.TaskInfo) bool {
+	return task.Status != api.Succeeded && task.Status != api.Failed
 }
 
-func (p *plugin) unreserve(task *api.TaskInfo) {
-	// Eviction is asynchronous; a terminating pod may still consume CPU.
-	if task.Status == api.Releasing {
-		return
+// projected scans the supplied node snapshot. Preemption modifies a cloned NodeInfo,
+// so simulations, reprieves and rollbacks cannot mutate a separate global quota cache.
+// future accounts for pipelined replacements; current retains terminating pods until removal.
+func (p *plugin) projected(task *api.TaskInfo, node *api.NodeInfo, current bool) float64 {
+	total := requests(task).MilliCPU
+	for _, existing := range node.Tasks {
+		if existing.UID == task.UID || !active(existing) || !p.isCPU(existing) {
+			continue
+		}
+		if current && existing.Status == api.Pipelined {
+			continue
+		}
+		if !current && existing.Status == api.Releasing {
+			continue
+		}
+		total += requests(existing).MilliCPU
 	}
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	delete(p.reserved, task.UID)
+	return total
+}
+
+func (p *plugin) check(task *api.TaskInfo, node *api.NodeInfo, current bool) error {
+	if p.configErr != nil {
+		return p.configErr
+	}
+	if !p.managed(node) {
+		return nil
+	}
+	if !p.isCPU(task) {
+		return nil
+	}
+	if requests(task).MilliCPU <= 0 {
+		return fmt.Errorf("halfbinpack: CPU-only pod must declare positive CPU requests")
+	}
+	quota := p.quota(node)
+	used := p.projected(task, node, current)
+	if used > quota {
+		return fmt.Errorf("halfbinpack: CPU-only requests %.0fm exceed quota %.0fm (%.2f%% of allocatable CPU)", used, quota, p.cfg.CPURatio)
+	}
+	return nil
+}
+
+func podPriority(task *api.TaskInfo) int32 {
+	if task.Pod != nil && task.Pod.Spec.Priority != nil {
+		return *task.Pod.Spec.Priority
+	}
+	return 0
+}
+
+// victims uses only Pod priority; NPU resources and Job priority do not grant special treatment.
+func victims(preemptor *api.TaskInfo, candidates []*api.TaskInfo) ([]*api.TaskInfo, int) {
+	if preemptor == nil || (preemptor.Pod != nil && preemptor.Pod.Spec.PreemptionPolicy != nil && *preemptor.Pod.Spec.PreemptionPolicy == v1.PreemptNever) {
+		return nil, util.Permit
+	}
+	result := make([]*api.TaskInfo, 0, len(candidates))
+	for _, candidate := range candidates {
+		if podPriority(candidate) < podPriority(preemptor) {
+			result = append(result, candidate)
+		}
+	}
+	return result, util.Permit
 }
 
 func (p *plugin) OnSessionOpen(ssn *framework.Session) {
-	p.metrics = make(map[string]sample)
-	p.reserved = make(map[api.TaskID]reservation)
-	if p.configErr == nil {
-		// One batch snapshot per session; never perform network I/O in node predicates.
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		metrics, err := p.fetch(ctx, time.Now())
-		cancel()
-		if err != nil {
-			klog.Errorf("halfbinpack metrics unavailable: %v", err)
-		} else {
-			p.metrics = metrics
-		}
-	} else {
+	ssn.StrictPodPreemption = true
+	if p.configErr != nil {
 		klog.Error(p.configErr)
 	}
-	// Rebuild across sessions and scheduler restarts. Include NPU jobs too: their new CPU
-	// consumption must reduce the headroom available to CPU jobs.
-	for _, node := range ssn.Nodes {
-		if !mixed(node) {
-			continue
+	predicate := func(task *api.TaskInfo, node *api.NodeInfo) error {
+		if err := p.check(task, node, false); err != nil {
+			return api.NewFitErrWithStatus(task, node, &api.Status{Plugin: PluginName, Code: api.Unschedulable, Reason: err.Error()})
 		}
-		for _, task := range node.Tasks {
-			if p.unobserved(task, p.metrics[node.Name]) {
-				p.reserve(task)
-			}
-		}
+		return nil
 	}
-	ssn.AddEventHandler(&framework.EventHandler{
-		AllocateFunc: func(e *framework.Event) {
-			// Recheck at allocation: scoring and filtering alone cannot reject a
-			// candidate whose snapshot expires just before it is allocated.
-			if node := ssn.Nodes[e.Task.NodeName]; node != nil && mixed(node) && p.isCPU(e.Task) {
-				if _, err := p.projected(e.Task, node, time.Now()); err != nil {
-					e.Err = err
-					return
-				}
-			}
-			p.reserve(e.Task)
-		},
-		DeallocateFunc: func(e *framework.Event) { p.unreserve(e.Task) },
+	ssn.AddPredicateFn(p.Name(), predicate)
+	ssn.AddSimulatePredicateFn(p.Name(), func(_ context.Context, _ fwk.CycleState, task *api.TaskInfo, node *api.NodeInfo) error {
+		return predicate(task, node)
 	})
-	ssn.AddPredicateFn(p.Name(), func(task *api.TaskInfo, node *api.NodeInfo) error {
-		if !mixed(node) || !p.isCPU(task) {
-			return nil
+	// No simulate add/remove handlers are needed: the framework updates the cloned node.Tasks.
+	ssn.AddEventHandler(&framework.EventHandler{AllocateFunc: func(e *framework.Event) {
+		node := ssn.Nodes[e.Task.NodeName]
+		if node == nil {
+			e.Err = fmt.Errorf("halfbinpack: allocated node %q missing", e.Task.NodeName)
+			return
 		}
-		_, err := p.projected(task, node, time.Now())
-		if err == nil {
-			return nil
+		if err := p.check(e.Task, node, false); err != nil {
+			e.Err = err
+			return
 		}
-		return api.NewFitErrWithStatus(task, node, &api.Status{
-			Plugin: PluginName, Code: api.Unschedulable, Reason: err.Error(),
-		})
-	})
+		if e.Task.Status != api.Pipelined {
+			e.Err = p.check(e.Task, node, true)
+		}
+	}})
 	ssn.AddNodeOrderFn(p.Name(), func(task *api.TaskInfo, node *api.NodeInfo) (float64, error) {
-		if !mixed(node) || !p.isCPU(task) {
+		if !p.managed(node) || !p.isCPU(task) || p.check(task, node, false) != nil {
 			return 0, nil
 		}
-		load, err := p.projected(task, node, time.Now())
-		if err != nil {
+		quota := p.quota(node)
+		if quota <= 0 {
 			return 0, nil
 		}
-		return p.score(load), nil
+		return 100 * p.cfg.Weight * p.projected(task, node, false) / quota, nil
+	})
+	ssn.AddTaskOrderFn(p.Name(), func(left, right interface{}) int {
+		l, r := podPriority(left.(*api.TaskInfo)), podPriority(right.(*api.TaskInfo))
+		if l > r {
+			return -1
+		}
+		if l < r {
+			return 1
+		}
+		return 0
+	})
+	ssn.AddPreemptableFn(p.Name(), victims)
+	ssn.AddReclaimableFn(p.Name(), victims)
+	ssn.AddUnifiedEvictableFn(p.Name(), func(ctx *api.EvictionContext, candidates []*api.TaskInfo) ([]*api.TaskInfo, int) {
+		// Gang eviction has no individual preemptor Pod, so fail closed rather than substitute Job priority.
+		return victims(ctx.Task, candidates)
 	})
 }
 
-func (p *plugin) unobserved(task *api.TaskInfo, metric sample) bool {
-	switch task.Status {
-	case api.Allocated, api.Binding, api.Bound, api.Pipelined:
-		return true
-	case api.Running, api.Releasing:
-		return task.Pod == nil || task.Pod.Status.StartTime == nil ||
-			metric.observed.Before(task.Pod.Status.StartTime.Add(time.Duration(p.cfg.BlindSeconds)*time.Second))
-	}
-	return false
-}
-
-func (p *plugin) projected(task *api.TaskInfo, node *api.NodeInfo, now time.Time) (float64, error) {
-	if p.configErr != nil {
-		return 0, p.configErr
-	}
-	if !p.hasNPU(node) {
-		return 0, fmt.Errorf("halfbinpack: mixed node has no configured NPU resource")
-	}
-	p.mu.RLock()
-	defer p.mu.RUnlock()
-	m, exists := p.metrics[node.Name]
-	if !exists || m.observed.IsZero() || now.Sub(m.observed) > time.Duration(p.cfg.MaxAgeSeconds)*time.Second || m.observed.After(now) {
-		return 0, fmt.Errorf("halfbinpack: missing, stale or future CPU metrics")
-	}
-	// The Prometheus percentage is normalized by physical CPU capacity, not allocatable.
-	capacity := node.Node.Status.Capacity.Cpu().MilliValue()
-	if capacity <= 0 {
-		return 0, fmt.Errorf("halfbinpack: CPU capacity is zero")
-	}
-	estimated := p.estimate(task)
-	for uid, r := range p.reserved {
-		if r.node == node.Name && uid != task.UID {
-			estimated += r.cpu
-		}
-	}
-	load := m.percent + 100*estimated/float64(capacity)
-	if load > p.cfg.Upper {
-		return load, fmt.Errorf("halfbinpack: predicted CPU %.2f%% exceeds %.2f%%", load, p.cfg.Upper)
-	}
-	return load, nil
-}
-
-func (p *plugin) OnSessionClose(_ *framework.Session) {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	p.metrics = nil
-	p.reserved = nil
-}
-
-func finite(v float64) bool { return !math.IsNaN(v) && !math.IsInf(v, 0) }
-
-func (p *plugin) score(load float64) float64 {
-	// The lower threshold is a scoring target, never an admission floor.
-	if load < p.cfg.Lower && p.cfg.Lower > 0 {
-		return 50 * p.cfg.Weight * load / p.cfg.Lower
-	}
-	return p.cfg.Weight * (50 + 50*(load-p.cfg.Lower)/(p.cfg.Upper-p.cfg.Lower))
-}
-
-// fetch uses a companion raw-sample timestamp query. Instant expression evaluation
-// timestamps alone cannot detect an exporter that stopped reporting.
-func (p *plugin) fetch(ctx context.Context, now time.Time) (map[string]sample, error) {
-	client, err := promapi.NewClient(promapi.Config{Address: p.cfg.Address})
-	if err != nil {
-		return nil, err
-	}
-	query := promv1.NewAPI(client)
-	read := func(expression string) (map[string]float64, error) {
-		value, warnings, err := query.Query(ctx, expression, now)
-		if err != nil {
-			return nil, err
-		}
-		if len(warnings) > 0 {
-			return nil, fmt.Errorf("partial metrics: %v", warnings)
-		}
-		vector, ok := value.(model.Vector)
-		if !ok {
-			return nil, fmt.Errorf("expected an instant vector")
-		}
-		result := make(map[string]float64)
-		for _, point := range vector {
-			name := string(point.Metric["node"])
-			v := float64(point.Value)
-			if name == "" || !finite(v) {
-				return nil, fmt.Errorf("invalid metric or missing node label")
-			}
-			if _, duplicate := result[name]; duplicate {
-				return nil, fmt.Errorf("duplicate metric for node %s", name)
-			}
-			result[name] = v
-		}
-		return result, nil
-	}
-	cpu, err := read(p.cfg.CPUQuery)
-	if err != nil {
-		return nil, err
-	}
-	timestamps, err := read(p.cfg.TimestampQuery)
-	if err != nil {
-		return nil, err
-	}
-	result := make(map[string]sample)
-	for name, percent := range cpu {
-		ts, ok := timestamps[name]
-		if !ok || percent < 0 || percent > 100 || ts <= 0 || ts > float64(now.Unix())+1 {
-			continue
-		}
-		result[name] = sample{percent: percent, observed: time.Unix(int64(ts), 0)}
-	}
-	return result, nil
-}
+func (*plugin) OnSessionClose(_ *framework.Session) {}

@@ -25,6 +25,7 @@ import (
 	"errors"
 	"sort"
 
+	v1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/util/sets"
 	"k8s.io/klog/v2"
 	fwk "k8s.io/kube-scheduler/framework"
@@ -228,6 +229,9 @@ func (ssn *Session) AddHyperNodeGradientForSubJobFn(name string, fn api.HyperNod
 
 // Reclaimable invoke reclaimable function of the plugins
 func (ssn *Session) Reclaimable(reclaimer *api.TaskInfo, reclaimees []*api.TaskInfo) []*api.TaskInfo {
+	if ssn.StrictPodPreemption {
+		reclaimees = lowerPodPriorityTasks(reclaimer, reclaimees)
+	}
 	var victims []*api.TaskInfo
 
 	for _, tier := range ssn.Tiers {
@@ -277,6 +281,9 @@ func (ssn *Session) Reclaimable(reclaimer *api.TaskInfo, reclaimees []*api.TaskI
 
 // Preemptable invoke preemptable function of the plugins
 func (ssn *Session) Preemptable(preemptor *api.TaskInfo, preemptees []*api.TaskInfo) []*api.TaskInfo {
+	if ssn.StrictPodPreemption {
+		preemptees = lowerPodPriorityTasks(preemptor, preemptees)
+	}
 	var victims []*api.TaskInfo
 
 	for _, tier := range ssn.Tiers {
@@ -328,6 +335,13 @@ func (ssn *Session) Preemptable(preemptor *api.TaskInfo, preemptees []*api.TaskI
 // UnifiedEvictable invokes UnifiedEvictableFn plugins for gang-aware victim filtering.
 // Tier walking and intersection semantics match Preemptable/Reclaimable.
 func (ssn *Session) UnifiedEvictable(ctx *api.EvictionContext, candidates []*api.TaskInfo) []*api.TaskInfo {
+	if ssn.StrictPodPreemption {
+		// Gang eviction has no individual preemptor Pod; do not substitute Job priority.
+		if ctx.Task == nil {
+			return nil
+		}
+		candidates = lowerPodPriorityTasks(ctx.Task, candidates)
+	}
 	var victims []*api.TaskInfo
 
 	for _, tier := range ssn.Tiers {
@@ -1304,6 +1318,9 @@ func (ssn *Session) BuildVictimsPriorityQueue(victims []*api.TaskInfo, preemptor
 	victimsQueue := util.NewPriorityQueue(func(l, r interface{}) bool {
 		lv := l.(*api.TaskInfo)
 		rv := r.(*api.TaskInfo)
+		if ssn.StrictPodPreemption && taskPodPriority(lv) != taskPodPriority(rv) {
+			return taskPodPriority(lv) < taskPodPriority(rv)
+		}
 		if lv.Job == rv.Job {
 			return !ssn.TaskOrderFn(l, r)
 		}
@@ -1437,4 +1454,25 @@ func (ssn *Session) queueScope(queueID api.QueueID) []api.QueueID {
 		current = parent
 	}
 	return scope
+}
+
+// taskPodPriority follows Kubernetes' default priority of zero for an unspecified Pod priority.
+func taskPodPriority(task *api.TaskInfo) int32 {
+	if task.Pod != nil && task.Pod.Spec.Priority != nil {
+		return *task.Pod.Spec.Priority
+	}
+	return 0
+}
+
+func lowerPodPriorityTasks(preemptor *api.TaskInfo, candidates []*api.TaskInfo) []*api.TaskInfo {
+	if preemptor == nil || (preemptor.Pod != nil && preemptor.Pod.Spec.PreemptionPolicy != nil && *preemptor.Pod.Spec.PreemptionPolicy == v1.PreemptNever) {
+		return nil
+	}
+	result := make([]*api.TaskInfo, 0, len(candidates))
+	for _, task := range candidates {
+		if taskPodPriority(task) < taskPodPriority(preemptor) {
+			result = append(result, task)
+		}
+	}
+	return result
 }
