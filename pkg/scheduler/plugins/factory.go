@@ -32,6 +32,7 @@ import (
 	"volcano.sh/volcano/pkg/scheduler/plugins/fairshare"
 	"volcano.sh/volcano/pkg/scheduler/plugins/gang"
 	grouptopologyaffinity "volcano.sh/volcano/pkg/scheduler/plugins/group-topology-affinity"
+	"volcano.sh/volcano/pkg/scheduler/plugins/halfbinpack"
 	networktopologyaware "volcano.sh/volcano/pkg/scheduler/plugins/network-topology-aware"
 	"volcano.sh/volcano/pkg/scheduler/plugins/nodegroup"
 	"volcano.sh/volcano/pkg/scheduler/plugins/nodeorder"
@@ -60,6 +61,7 @@ func init() {
 	framework.RegisterPluginBuilder(nodeorder.PluginName, nodeorder.New)
 	framework.RegisterPluginBuilder(conformance.PluginName, conformance.New)
 	framework.RegisterPluginBuilder(binpack.PluginName, binpack.New)
+	framework.RegisterPluginBuilder(halfbinpack.PluginName, halfbinpack.New)
 	framework.RegisterPluginBuilder(resourcestrategyfit.PluginName, resourcestrategyfit.New)
 	framework.RegisterPluginBuilder(tdm.PluginName, tdm.New)
 	framework.RegisterPluginBuilder(overcommit.PluginName, overcommit.New)
