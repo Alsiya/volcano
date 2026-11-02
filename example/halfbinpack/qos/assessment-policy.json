@@ -1,0 +1,10 @@
+{
+  "name": "npu-cpu-qos-phase2-assessment-only",
+  "required": [
+    {"dimension": "cpu", "mechanism": "cpu.qos.hce"},
+    {"dimension": "memory", "mechanism": "memory.protection.v2"},
+    {"dimension": "memory", "mechanism": "memory.throttle.v2"},
+    {"dimension": "network", "mechanism": "network.netcls.v1"},
+    {"dimension": "io", "mechanism": "io.max.v2"}
+  ]
+}

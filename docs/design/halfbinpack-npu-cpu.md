@@ -82,3 +82,7 @@ CGO_ENABLED=0 go test ./pkg/scheduler/plugins/halfbinpack ./pkg/scheduler/plugin
 真实 NPU 集群验收应覆盖 ERS 提交模板与 PriorityClass 权限、NPU/CPU 跨类型抢占、CPU 配额边界、受害者删除延迟、调度器重启、原地扩容准入、节点资源变更和多实例统一策略。
 
 2026-10-27 本地验证：Go 1.26.0、CGO_ENABLED=0，上述插件/注册包/框架三个包，以及 actions/allocate、actions/backfill、actions/preempt、actions/reclaim 四个包的测试均通过；gofmt 检查通过。新增测试直接调用上游 SelectVictimsOnNode 验证合法替换与高优先级超配额拒绝。尚未在真实 NPU 集群或 ERS 环境验收。
+
+## 第二阶段
+
+运行时 CPU / 内存 / 网络 / 磁盘 IO 的支持性评估与独立 Agent 契约见 [第二阶段设计](halfbinpack-qos-phase2.md)。当前新增只读探测工具，不改变本阶段 requests 配额或抢占行为，不代表生产 QoS 隔离已经生效。
